@@ -212,6 +212,7 @@ with tab1:
                         "question": pregunta,
                         "collection": COLLECTION,
                         "use_rerank": True,
+                        "max_tokens": 1200,
                     },
                     timeout=60,
                 )
@@ -338,6 +339,12 @@ with tab2:
    Si el texto entregado no incluye una lista de referencias o citas, indicalo
    como un problema a corregir en vez de inventar una evaluacion."""
 
+    if revisar and not texto_estudiante.strip():
+        st.warning(
+            "No hay texto para revisar. Suba un archivo válido (.docx, .pdf o "
+            ".txt) o pegue el texto directamente en el cuadro de arriba."
+        )
+
     if revisar and texto_estudiante.strip():
         seccion_extra_titulo = "\n   NORMAS APA Y REDACCION:" if revisar_apa else ""
         seccion_extra_detalle = f"\n{INSTRUCCION_APA}" if revisar_apa else ""
@@ -379,6 +386,7 @@ Texto del estudiante:
                         "question": instrucciones,
                         "collection": COLLECTION,
                         "use_rerank": True,
+                        "max_tokens": 2000,
                     },
                     timeout=90,
                 )
