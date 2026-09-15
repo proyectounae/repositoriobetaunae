@@ -134,27 +134,36 @@ def generar_pdf(pregunta: str, respuesta: str) -> bytes:
     respuesta = _sanear(respuesta)
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.multi_cell(0, 8, "Asistente de Escritura Academica - UNAE")
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(100, 100, 100)
-    pdf.multi_cell(0, 6, datetime.now().strftime("Generado el %d/%m/%Y a las %H:%M"))
+
+    def linea(texto, size=11, bold=False, color=(0, 0, 0)):
+        # Fuerza que el cursor vuelva siempre al margen izquierdo antes y
+        # despues de escribir, para evitar el error "Not enough horizontal
+        # space" de fpdf2 cuando el cursor queda pegado al margen derecho.
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "B" if bold else "", size)
+        pdf.set_text_color(*color)
+        pdf.multi_cell(
+            pdf.w - pdf.l_margin - pdf.r_margin,
+            size * 0.6,
+            texto,
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+
+    linea("Asistente de Escritura Academica - UNAE", size=14, bold=True, color=(76, 1, 62))
+    linea(
+        datetime.now().strftime("Generado el %d/%m/%Y a las %H:%M"),
+        size=9,
+        color=(100, 100, 100),
+    )
     pdf.ln(4)
 
-    pdf.set_text_color(18, 48, 92)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.multi_cell(0, 7, "Pregunta:")
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 11)
-    pdf.multi_cell(0, 7, pregunta)
+    linea("Pregunta:", size=11, bold=True, color=(18, 48, 92))
+    linea(pregunta, size=11)
     pdf.ln(3)
 
-    pdf.set_text_color(18, 48, 92)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.multi_cell(0, 7, "Respuesta:")
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 11)
-    pdf.multi_cell(0, 7, respuesta)
+    linea("Respuesta:", size=11, bold=True, color=(18, 48, 92))
+    linea(respuesta, size=11)
 
     raw = pdf.output(dest="S")
     if isinstance(raw, (bytes, bytearray)):
