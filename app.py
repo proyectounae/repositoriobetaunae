@@ -115,108 +115,313 @@ if not API_KEY:
 
 if "historial" not in st.session_state:
     st.session_state.historial = []
+if "historial_retro" not in st.session_state:
+    st.session_state.historial_retro = []
 
 
 def _sanear(texto: str) -> str:
     """Las fuentes básicas del PDF solo soportan latin-1; se reemplazan
     comillas tipográficas, guiones largos, viñetas, etc. por equivalentes simples."""
     reemplazos = {
-        "‘": "'", "’": "'", "“": '"', "”": '"',
-        "–": "-", "—": "-", "•": "-", "…": "...",
+        "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+        "\u2013": "-", "\u2014": "-", "\u2022": "-", "\u2026": "...",
     }
     for viejo, nuevo in reemplazos.items():
         texto = texto.replace(viejo, nuevo)
     return texto.encode("latin-1", errors="replace").decode("latin-1")
 
 
-def generar_pdf(pregunta: str, respuesta: str) -> bytes:
-    pregunta = _sanear(pregunta)
-    respuesta = _sanear(respuesta)
+def _pdf_bloque(pdf, texto, size=11, bold=False, color=(0, 0, 0)):
+    # Fuerza que el cursor vuelva siempre al margen izquierdo antes y
+    # despues de escribir, para evitar el error "Not enough horizontal
+    # space" de fpdf2 cuando el cursor queda pegado al margen derecho.
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B" if bold else "", size)
+    pdf.set_text_color(*color)
+    pdf.multi_cell(
+        pdf.w - pdf.l_margin - pdf.r_margin,
+        size * 0.6,
+        texto,
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+
+
+def construir_pdf(titulo: str, secciones) -> bytes:
+    """secciones: lista de tuplas (encabezado, cuerpo)."""
     pdf = FPDF()
     pdf.add_page()
-
-    def linea(texto, size=11, bold=False, color=(0, 0, 0)):
-        # Fuerza que el cursor vuelva siempre al margen izquierdo antes y
-        # despues de escribir, para evitar el error "Not enough horizontal
-        # space" de fpdf2 cuando el cursor queda pegado al margen derecho.
-        pdf.set_x(pdf.l_margin)
-        pdf.set_font("Helvetica", "B" if bold else "", size)
-        pdf.set_text_color(*color)
-        pdf.multi_cell(
-            pdf.w - pdf.l_margin - pdf.r_margin,
-            size * 0.6,
-            texto,
-            new_x="LMARGIN",
-            new_y="NEXT",
-        )
-
-    linea("Asistente de Escritura Academica - UNAE", size=14, bold=True, color=(76, 1, 62))
-    linea(
+    _pdf_bloque(pdf, _sanear(titulo), size=14, bold=True, color=(76, 1, 62))
+    _pdf_bloque(
+        pdf,
         datetime.now().strftime("Generado el %d/%m/%Y a las %H:%M"),
         size=9,
         color=(100, 100, 100),
     )
     pdf.ln(4)
-
-    linea("Pregunta:", size=11, bold=True, color=(18, 48, 92))
-    linea(pregunta, size=11)
-    pdf.ln(3)
-
-    linea("Respuesta:", size=11, bold=True, color=(18, 48, 92))
-    linea(respuesta, size=11)
-
+    for encabezado, cuerpo in secciones:
+        _pdf_bloque(pdf, _sanear(encabezado), size=11, bold=True, color=(18, 48, 92))
+        _pdf_bloque(pdf, _sanear(cuerpo), size=11)
+        pdf.ln(3)
     raw = pdf.output(dest="S")
     if isinstance(raw, (bytes, bytearray)):
         return bytes(raw)
-    # Compatibilidad con versiones antiguas de fpdf que devuelven str (latin-1)
     return raw.encode("latin-1")
 
 
-pregunta = st.text_area("Escriba su pregunta o consulta:", height=100)
+def extraer_texto_archivo(archivo) -> str:
+    """Extrae texto de un archivo subido por el estudiante (.txt, .docx o .pdf)."""
+    nombre = archivo.name.lower()
+    try:
+        if nombre.endswith(".txt"):
+            return archivo.read().decode("utf-8", errors="replace")
+        elif nombre.endswith(".docx"):
+            from docx import Document
+            doc = Document(archivo)
+            return "\n".join(p.text for p in doc.paragraphs)
+        elif nombre.endswith(".pdf"):
+            from pypdf import PdfReader
+            reader = PdfReader(archivo)
+            return "\n".join((pagina.extract_text() or "") for pagina in reader.pages)
+        else:
+            return ""
+    except Exception as e:
+        st.error(f"No se pudo leer el archivo: {e}")
+        return ""
 
-col1, col2 = st.columns([1, 5])
-with col1:
-    enviar = st.button("Consultar", type="primary")
 
-if enviar and pregunta.strip():
-    with st.spinner("Consultando la base de conocimiento..."):
-        try:
-            resp = requests.post(
-                f"{CEDIA_BASE_URL}/rag",
-                headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
-                json={
-                    "question": pregunta,
-                    "collection": COLLECTION,
-                    "use_rerank": True,
-                },
-                timeout=60,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                respuesta = data.get("answer", "(sin respuesta)")
-                st.session_state.historial.insert(0, (pregunta, respuesta))
-            else:
-                st.error(f"Error {resp.status_code}: {resp.text}")
-        except requests.exceptions.RequestException as e:
-            st.error(f"No se pudo conectar con el servicio: {e}")
+tab1, tab2 = st.tabs(["📖 Consultar el manual", "✍️ Revisar mi texto académico"])
 
-st.divider()
+# ============================================================
+# TAB 1: Preguntas y respuestas sobre el manual (RAG)
+# ============================================================
+with tab1:
+    pregunta = st.text_area("Escriba su pregunta o consulta:", height=100, key="pregunta_manual")
 
-for i, (q, a) in enumerate(st.session_state.historial):
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        enviar = st.button("Consultar", type="primary", key="btn_consultar")
+
+    if enviar and pregunta.strip():
+        with st.spinner("Consultando la base de conocimiento..."):
+            try:
+                resp = requests.post(
+                    f"{CEDIA_BASE_URL}/rag",
+                    headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "question": pregunta,
+                        "collection": COLLECTION,
+                        "use_rerank": True,
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    respuesta = data.get("answer", "(sin respuesta)")
+                    st.session_state.historial.insert(0, (pregunta, respuesta))
+                else:
+                    st.error(f"Error {resp.status_code}: {resp.text}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"No se pudo conectar con el servicio: {e}")
+
+    st.divider()
+
+    for i, (q, a) in enumerate(st.session_state.historial):
+        st.markdown(
+            f"""
+            <div class="qa-card">
+                <div class="qa-question">❓ {q}</div>
+                <div class="qa-answer">{a}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        pdf_bytes = construir_pdf(
+            "Asistente de Escritura Academica - UNAE",
+            [("Pregunta:", q), ("Respuesta:", a)],
+        )
+        st.download_button(
+            label="📄 Descargar esta respuesta en PDF",
+            data=pdf_bytes,
+            file_name=f"respuesta_{i+1}.pdf",
+            mime="application/pdf",
+            key=f"pdf_{i}",
+        )
+
+# ============================================================
+# TAB 2: Retroalimentación sobre el texto del propio estudiante
+# El programa NUNCA reescribe el texto; solo da retroalimentación.
+# La decisión final sobre cómo mejorar el texto es del estudiante.
+# ============================================================
+with tab2:
     st.markdown(
-        f"""
-        <div class="qa-card">
-            <div class="qa-question">❓ {q}</div>
-            <div class="qa-answer">{a}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        "Suba o pegue el texto de su **ensayo, artículo científico o proyecto de "
+        "titulación**. El asistente le da retroalimentación sobre la estructura y "
+        "los argumentos — **no reescribe el texto por usted**; la decisión final "
+        "sobre cómo mejorarlo es siempre suya."
     )
-    pdf_bytes = generar_pdf(q, a)
-    st.download_button(
-        label="📄 Descargar esta respuesta en PDF",
-        data=pdf_bytes,
-        file_name=f"respuesta_{i+1}.pdf",
-        mime="application/pdf",
-        key=f"pdf_{i}",
+
+    tipo_doc = st.selectbox(
+        "Tipo de documento",
+        ["Ensayo", "Artículo científico", "Proyecto de titulación (tesis)"],
+        key="tipo_doc",
     )
+
+    archivo = st.file_uploader(
+        "Suba su archivo (.docx, .pdf o .txt) — opcional, también puede pegar el texto abajo",
+        type=["docx", "pdf", "txt"],
+        key="archivo_estudiante",
+    )
+
+    texto_desde_archivo = ""
+    if archivo is not None:
+        texto_desde_archivo = extraer_texto_archivo(archivo)
+        if texto_desde_archivo:
+            st.success(f"Se extrajeron {len(texto_desde_archivo)} caracteres de '{archivo.name}'.")
+
+    texto_estudiante = st.text_area(
+        "O pegue aquí el texto:",
+        value=texto_desde_archivo,
+        height=280,
+        key="texto_estudiante",
+    )
+
+    if len(texto_estudiante) > 15000:
+        st.warning(
+            f"El texto tiene {len(texto_estudiante):,} caracteres. Documentos muy "
+            "extensos (una tesis completa, por ejemplo) pueden exceder lo que el "
+            "modelo puede procesar en una sola revisión. Si la respuesta sale "
+            "incompleta o con error, revise por capítulos (ej. primero el marco "
+            "teórico, luego la metodología, etc.) en vez de todo el documento junto."
+        )
+
+    revisar_apa = st.checkbox(
+        "Incluir revisión de normas APA (citas y referencias) y de redacción "
+        "(gramática, claridad, cohesión)",
+        value=True,
+        key="revisar_apa",
+    )
+
+    revisar = st.button("Revisar mi texto", type="primary", key="btn_revisar")
+
+    CRITERIOS = {
+        "Ensayo": (
+            "Evalúa principalmente: claridad de la tesis u opinión central, "
+            "solidez de los argumentos, uso de evidencia o ejemplos, coherencia "
+            "entre párrafos, y voz propia del autor."
+        ),
+        "Artículo científico": (
+            "Evalúa principalmente: estructura IMRAD (Introducción, Métodos, "
+            "Resultados, Discusión) si aplica, rigor metodológico, claridad de "
+            "la pregunta de investigación, uso adecuado de citas, y coherencia "
+            "entre objetivos y conclusiones."
+        ),
+        "Proyecto de titulación (tesis)": (
+            "Evalúa principalmente: planteamiento del problema, justificación, "
+            "objetivos, estructura del marco teórico, metodología propuesta, y "
+            "que la tesis (idea central) esté claramente formulada y sostenida "
+            "de forma estructurada a lo largo del documento."
+        ),
+    }
+
+    INSTRUCCION_APA = """7. Ademas, agrega una septima seccion titulada NORMAS APA Y REDACCION,
+   donde:
+   - Revises las citas dentro del texto: formato autor-fecha (ej. (Apellido,
+     Anio)), uso correcto de citas textuales cortas (con comillas) y citas
+     textuales largas de mas de 40 palabras (que deberian ir en bloque aparte).
+   - Revises si cada cita dentro del texto tiene su referencia correspondiente
+     al final, y si el formato de esas referencias parece seguir APA (autor,
+     anio, titulo, fuente).
+   - Revises redaccion: claridad de las oraciones, cohesion entre parrafos,
+     consistencia en el tiempo verbal, y errores evidentes de gramatica u
+     ortografia.
+   Si el texto entregado no incluye una lista de referencias o citas, indicalo
+   como un problema a corregir en vez de inventar una evaluacion."""
+
+    if revisar and texto_estudiante.strip():
+        seccion_extra_titulo = "\n   NORMAS APA Y REDACCION:" if revisar_apa else ""
+        seccion_extra_detalle = f"\n{INSTRUCCION_APA}" if revisar_apa else ""
+
+        instrucciones = f"""Eres un tutor de escritura academica. Tu unica funcion es dar
+retroalimentacion pedagogica sobre el texto que el estudiante te entrega a
+continuacion (tipo de documento: {tipo_doc}). Sigue estas reglas de forma
+estricta:
+
+1. NUNCA reescribas el texto ni entregues redaccion alternativa lista para
+   copiar y pegar. No escribas ni un parrafo del texto por el estudiante.
+2. Senala con precision que partes son debiles y por que, citando fragmentos
+   concretos del texto entregado.
+3. Da sugerencias claras de que debe mejorar y como pensar el problema, pero
+   la decision final de como reescribirlo queda siempre en manos del
+   estudiante.
+4. {{criterio}}
+5. Se honesto y constructivo: no elogies de forma gratuita, senala los
+   problemas reales con respeto.
+6. Estructura tu respuesta exactamente en estas secciones, con esos
+   titulos:
+   FORTALEZAS:
+   PROBLEMAS PRINCIPALES:
+   PREGUNTAS PARA REFLEXIONAR:
+   PROXIMOS PASOS:{seccion_extra_titulo}{seccion_extra_detalle}
+
+Texto del estudiante:
+\"\"\"
+{{texto}}
+\"\"\"
+""".format(criterio=CRITERIOS[tipo_doc], texto=texto_estudiante)
+
+        with st.spinner("Revisando el texto (buscando también en la guía APA y el manual guardados)..."):
+            try:
+                resp = requests.post(
+                    f"{CEDIA_BASE_URL}/rag",
+                    headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "question": instrucciones,
+                        "collection": COLLECTION,
+                        "use_rerank": True,
+                    },
+                    timeout=90,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        retro = (
+                            data.get("answer")
+                            or data.get("response")
+                            or data.get("text")
+                            or data.get("content")
+                            or data.get("message")
+                            or data.get("output")
+                            or str(data)
+                        )
+                    else:
+                        retro = str(data)
+                    st.session_state.historial_retro.insert(0, (tipo_doc, texto_estudiante, retro))
+                else:
+                    st.error(f"Error {resp.status_code}: {resp.text}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"No se pudo conectar con el servicio: {e}")
+
+    st.divider()
+
+    for i, (tipo, texto_orig, retro) in enumerate(st.session_state.historial_retro):
+        st.markdown(
+            f"""
+            <div class="qa-card">
+                <div class="qa-question">📝 Retroalimentación — {tipo}</div>
+                <div class="qa-answer">{retro}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        pdf_bytes = construir_pdf(
+            f"Retroalimentacion de escritura academica - {tipo}",
+            [("Retroalimentacion:", retro)],
+        )
+        st.download_button(
+            label="📄 Descargar esta retroalimentación en PDF",
+            data=pdf_bytes,
+            file_name=f"retroalimentacion_{i+1}.pdf",
+            mime="application/pdf",
+            key=f"pdf_retro_{i}",
+        )
