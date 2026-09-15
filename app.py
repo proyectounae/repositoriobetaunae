@@ -388,7 +388,7 @@ Texto del estudiante:
                         "use_rerank": True,
                         "max_tokens": 2000,
                     },
-                    timeout=90,
+                    timeout=240,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
