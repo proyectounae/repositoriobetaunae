@@ -309,13 +309,17 @@ with tab2:
         key="texto_estudiante",
     )
 
-    if len(texto_estudiante) > 15000:
+    LIMITE_CARACTERES_REVISION = 50000
+
+    if len(texto_estudiante) > 30000:
         st.warning(
-            f"El texto tiene {len(texto_estudiante):,} caracteres. Documentos muy "
-            "extensos (una tesis completa, por ejemplo) pueden exceder lo que el "
-            "modelo puede procesar en una sola revisión. Si la respuesta sale "
-            "incompleta o con error, revise por capítulos (ej. primero el marco "
-            "teórico, luego la metodología, etc.) en vez de todo el documento junto."
+            f"El texto tiene {len(texto_estudiante):,} caracteres. El modelo tiene "
+            "un límite de procesamiento por revisión: si el texto supera "
+            f"{LIMITE_CARACTERES_REVISION:,} caracteres, el sistema revisará "
+            "automáticamente solo la primera parte y se lo indicará. Para una "
+            "revisión completa de un documento largo (una tesis, por ejemplo), es "
+            "mejor revisarlo por capítulos (primero el marco teórico, luego la "
+            "metodología, etc.) en vez de todo el documento junto."
         )
 
     revisar_apa = st.checkbox(
@@ -368,6 +372,32 @@ with tab2:
         )
 
     if revisar and texto_estudiante.strip():
+        # El modelo tiene un límite duro de 32768 tokens entre lo que se le envía
+        # (instrucciones + texto del estudiante + fragmentos recuperados de la
+        # colección) y lo que genera como respuesta. Con textos muy largos (una
+        # tesis completa) ese límite se supera y el servicio responde con un
+        # error 502. Para evitarlo, se recorta el texto enviado a un tamaño
+        # seguro, sin tocar lo que el estudiante pegó o subió en pantalla.
+        texto_para_revisar = texto_estudiante
+        fue_recortado = False
+        if len(texto_para_revisar) > LIMITE_CARACTERES_REVISION:
+            corte = texto_para_revisar.rfind(" ", 0, LIMITE_CARACTERES_REVISION)
+            if corte == -1:
+                corte = LIMITE_CARACTERES_REVISION
+            texto_para_revisar = texto_para_revisar[:corte]
+            fue_recortado = True
+
+        if fue_recortado:
+            st.warning(
+                f"El texto tiene {len(texto_estudiante):,} caracteres, más de lo "
+                "que el sistema puede procesar en una sola revisión. Se revisaron "
+                f"solo los primeros {len(texto_para_revisar):,} caracteres "
+                f"(aproximadamente {len(texto_para_revisar)//6:,} palabras). Para "
+                "revisar el resto, péguelo o súbalo por separado (por ejemplo, "
+                "por capítulos: introducción, marco teórico, metodología, "
+                "resultados, conclusiones)."
+            )
+
         seccion_extra_titulo = "\n   NORMAS APA Y REDACCION:" if revisar_apa else ""
         seccion_extra_detalle = f"\n{INSTRUCCION_APA}" if revisar_apa else ""
 
@@ -397,7 +427,7 @@ Texto del estudiante:
 \"\"\"
 {{texto}}
 \"\"\"
-""".format(criterio=CRITERIOS[tipo_doc], texto=texto_estudiante)
+""".format(criterio=CRITERIOS[tipo_doc], texto=texto_para_revisar)
 
         with st.spinner("Revisando el texto (buscando también en la guía APA y el manual guardados)..."):
             try:
@@ -426,7 +456,7 @@ Texto del estudiante:
                         )
                     else:
                         retro = str(data)
-                    st.session_state.historial_retro.insert(0, (tipo_doc, texto_estudiante, retro))
+                    st.session_state.historial_retro.insert(0, (tipo_doc, texto_para_revisar, retro))
                 else:
                     st.error(f"Error {resp.status_code}: {resp.text}")
             except requests.exceptions.RequestException as e:
