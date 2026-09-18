@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import base64
+import io
 from datetime import datetime
 from fpdf import FPDF
 
@@ -151,6 +152,14 @@ def construir_pdf(titulo: str, secciones) -> bytes:
     """secciones: lista de tuplas (encabezado, cuerpo)."""
     pdf = FPDF()
     pdf.add_page()
+    try:
+        logo_bytes = base64.b64decode(LOGO_UNAE_B64)
+        pdf.image(io.BytesIO(logo_bytes), x=pdf.l_margin, y=pdf.t_margin, h=16)
+        # Deja espacio debajo del logo antes de seguir escribiendo texto
+        pdf.set_xy(pdf.l_margin, pdf.t_margin + 20)
+    except Exception:
+        # Si el logo no se puede insertar por algún motivo, el PDF se genera igual sin él
+        pass
     _pdf_bloque(pdf, _sanear(titulo), size=14, bold=True, color=(76, 1, 62))
     _pdf_bloque(
         pdf,
@@ -274,15 +283,28 @@ with tab2:
         key="archivo_estudiante",
     )
 
-    texto_desde_archivo = ""
+    # Nota tecnica: no se puede pasar value=... a st.text_area cuando ya tiene un
+    # key (Streamlit ignora el value en las siguientes ejecuciones). Por eso el
+    # texto extraido del archivo se escribe directamente en session_state antes
+    # de crear el widget, y solo cuando el archivo subido es nuevo.
     if archivo is not None:
-        texto_desde_archivo = extraer_texto_archivo(archivo)
-        if texto_desde_archivo:
-            st.success(f"Se extrajeron {len(texto_desde_archivo)} caracteres de '{archivo.name}'.")
+        identificador_archivo = f"{archivo.name}_{archivo.size}"
+        if st.session_state.get("_ultimo_archivo_procesado") != identificador_archivo:
+            texto_extraido = extraer_texto_archivo(archivo)
+            st.session_state["_ultimo_archivo_procesado"] = identificador_archivo
+            if texto_extraido:
+                st.session_state["texto_estudiante"] = texto_extraido
+                st.success(f"Se extrajeron {len(texto_extraido)} caracteres de '{archivo.name}'.")
+            else:
+                st.warning(
+                    f"No se pudo extraer texto de '{archivo.name}'. Si es un PDF "
+                    "escaneado (fotos de las páginas sin texto seleccionable), no "
+                    "hay texto que leer — pruebe subiendo el archivo en Word "
+                    "(.docx) o un PDF con texto real."
+                )
 
     texto_estudiante = st.text_area(
         "O pegue aquí el texto:",
-        value=texto_desde_archivo,
         height=280,
         key="texto_estudiante",
     )
