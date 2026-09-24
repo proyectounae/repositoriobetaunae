@@ -3,3 +3,5 @@ requests
 fpdf2
 python-docx
 pypdf
+gspread
+google-auth
