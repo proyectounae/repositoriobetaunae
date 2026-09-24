@@ -102,6 +102,7 @@ st.markdown(
             <h1>Asistente de Escritura Académica</h1>
             <p>Universidad Nacional de Educación — UNAE</p>
             <p>Proyecto de investigación · Piloto RAG con CEDIA (HPC AI Gateway)</p>
+            <p style="font-size:0.75rem; opacity:0.7;">Versión MMCD 1.2 · 24/09/2026</p>
         </div>
     </div>
     """,
@@ -170,7 +171,7 @@ def construir_pdf(titulo: str, secciones) -> bytes:
     _pdf_bloque(pdf, _sanear(titulo), size=14, bold=True, color=(76, 1, 62))
     _pdf_bloque(
         pdf,
-        datetime.now().strftime("Generado el %d/%m/%Y a las %H:%M"),
+        datetime.now(ZoneInfo("America/Guayaquil")).strftime("Generado el %d/%m/%Y a las %H:%M"),
         size=9,
         color=(100, 100, 100),
     )
@@ -489,6 +490,196 @@ def llamar_rag(pregunta: str, max_tokens: int = 2000, timeout: int = 240):
         return str(e), "error_conexion", round(time.perf_counter() - inicio, 2)
 
 
+# ---------- PDF de retroalimentación (MMCD), ordenado y con nota de cierre ----------
+COLOR_GUINDA = (76, 1, 62)
+COLOR_GRIS = (95, 95, 95)
+COLOR_FONDO = (246, 240, 244)
+
+NOTA_CIERRE = (
+    "El presente informe tiene carácter formativo y no constituye una calificación "
+    "ni sustituye la revisión de su tutor o docente. Conforme al Modelo de Mediación "
+    "Crítica Declarada (MMCD), el asistente no reescribe ni corrige su texto: señala "
+    "aspectos a revisar y formula preguntas para orientar su reflexión. La decisión "
+    "sobre qué cambios realizar, y su justificación, corresponde exclusivamente a "
+    "usted como autor o autora del trabajo."
+)
+
+
+class PDFInforme(FPDF):
+    """PDF con pie de página institucional y numeración en todas las páginas."""
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_draw_color(*COLOR_GUINDA)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(1.5)
+        self.set_font("Helvetica", "", 8)
+        self.set_text_color(*COLOR_GRIS)
+        self.cell(0, 5, _sanear("Asistente de Escritura Académica · UNAE · Piloto RAG con CEDIA"), align="L")
+        self.set_x(self.l_margin)
+        self.cell(0, 5, f"Página {self.page_no()} de {{nb}}", align="R")
+
+
+def _ancho_util(pdf):
+    return pdf.w - pdf.l_margin - pdf.r_margin
+
+
+def _titulo_seccion(pdf, numero, texto):
+    if pdf.get_y() > pdf.h - 45:
+        pdf.add_page()
+    pdf.ln(3)
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(*COLOR_GUINDA)
+    pdf.cell(0, 7, _sanear(f"{numero}. {texto}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_draw_color(*COLOR_GUINDA)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+    pdf.ln(3)
+
+
+def _item_numerado(pdf, numero, texto, sangria=8):
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 10.5)
+    pdf.set_text_color(*COLOR_GUINDA)
+    pdf.cell(sangria, 5.6, f"{numero}.")
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.set_text_color(0, 0, 0)
+    pdf.multi_cell(_ancho_util(pdf) - sangria, 5.6, _sanear(texto), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1.5)
+
+
+def _parsear_pregunta(linea: str):
+    """Separa '[EP] «cita» — ¿pregunta?' en (etiqueta, cita, pregunta)."""
+    m = re.match(r"^\s*\[(\w+)\]\s*«(.+?)»\s*[—–\-:]*\s*(.+)$", linea)
+    if not m:
+        m2 = re.match(r"^\s*\[(\w+)\]\s*(.+)$", linea)
+        return (m2.group(1), "", m2.group(2).strip()) if m2 else ("", "", linea.strip())
+    etiqueta, cita, pregunta = m.group(1), m.group(2).strip(), m.group(3).strip()
+    # Primera letra en mayúscula después de "¿" (el modelo suele escribirla en minúscula)
+    pregunta = re.sub(r"^(¿\s*)(\w)", lambda x: x.group(1) + x.group(2).upper(), pregunta)
+    return etiqueta, cita, pregunta
+
+
+def construir_pdf_retro(r: dict) -> bytes:
+    pdf = PDFInforme()
+    pdf.set_auto_page_break(auto=True, margin=22)
+    pdf.add_page()
+    ancho = _ancho_util(pdf)
+
+    # Encabezado
+    try:
+        pdf.image(io.BytesIO(base64.b64decode(LOGO_UNAE_B64)), x=pdf.l_margin, y=pdf.t_margin, h=16)
+        pdf.set_xy(pdf.l_margin, pdf.t_margin + 20)
+    except Exception:
+        pass
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_text_color(*COLOR_GUINDA)
+    pdf.cell(0, 8, _sanear("Informe de retroalimentación de escritura académica"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*COLOR_GRIS)
+    ahora = datetime.now(ZoneInfo("America/Guayaquil"))
+    pdf.cell(0, 5, _sanear(ahora.strftime("Generado el %d/%m/%Y a las %H:%M (hora de Ecuador)")), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # 1. Datos del texto revisado (tabla)
+    _titulo_seccion(pdf, 1, "Datos del texto revisado")
+    criterios_txt = "\n".join(f"{c} — {DIMENSIONES.get(c, '')}" for c in r["criterios"])
+    filas = [
+        ("Tipo de documento", r["tipo"]),
+        ("Sección", r["seccion"]),
+        ("Etapa del proceso", r["etapa"]),
+        ("Criterios priorizados", criterios_txt),
+    ]
+    col1 = 45
+    pdf.set_draw_color(220, 210, 218)
+    for etiqueta, valor in filas:
+        y0 = pdf.get_y()
+        pdf.set_font("Helvetica", "", 10)
+        alto = max(7, len(pdf.multi_cell(ancho - col1, 5.5, _sanear(valor), dry_run=True, output="LINES")) * 5.5 + 1.5)
+        pdf.set_fill_color(*COLOR_FONDO)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(*COLOR_GUINDA)
+        pdf.set_xy(pdf.l_margin, y0)
+        pdf.multi_cell(col1, alto, _sanear(etiqueta), border=1, fill=True)
+        pdf.set_xy(pdf.l_margin + col1, y0)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(0, 0, 0)
+        pdf.rect(pdf.l_margin + col1, y0, ancho - col1, alto)
+        pdf.set_xy(pdf.l_margin + col1 + 1.5, y0 + 0.75)
+        pdf.multi_cell(ancho - col1 - 3, 5.5, _sanear(valor))
+        pdf.set_xy(pdf.l_margin, y0 + alto)
+
+    # 2. Señalamientos formales
+    _titulo_seccion(pdf, 2, "Señalamientos formales (ortografía, gramática y normas APA)")
+    formales = [l.strip() for l in r["formal"].splitlines() if l.strip()]
+    for i, linea in enumerate(formales, 1):
+        _item_numerado(pdf, i, linea)
+
+    # 3. Preguntas de mediación crítica, agrupadas por criterio
+    _titulo_seccion(pdf, 3, "Preguntas de mediación crítica")
+    if not r["criticas"]:
+        _item_numerado(pdf, 1, "No se generaron preguntas válidas en esta ocasión.")
+    grupos = {}
+    for linea in r["criticas"]:
+        etiqueta, cita, pregunta = _parsear_pregunta(linea)
+        grupos.setdefault(etiqueta, []).append((cita, pregunta))
+    n = 0
+    for etiqueta, items in grupos.items():
+        if pdf.get_y() > pdf.h - 50:
+            pdf.add_page()
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.set_text_color(*COLOR_GUINDA)
+        nombre = DIMENSIONES.get(etiqueta, "")
+        pdf.multi_cell(ancho, 6, _sanear(f"Criterio {etiqueta}" + (f" — {nombre}" if nombre else "")), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+        for cita, pregunta in items:
+            n += 1
+            if pdf.get_y() > pdf.h - 40:
+                pdf.add_page()
+            sangria = 8
+            pdf.set_x(pdf.l_margin)
+            pdf.set_font("Helvetica", "B", 10.5)
+            pdf.cell(sangria, 5.6, f"{n}.")
+            if cita:
+                pdf.set_font("Helvetica", "I", 9.5)
+                pdf.set_text_color(*COLOR_GRIS)
+                pdf.multi_cell(ancho - sangria, 5.2, _sanear(f"Fragmento citado: «{cita}»"), new_x="LMARGIN", new_y="NEXT")
+                pdf.set_x(pdf.l_margin + sangria)
+            pdf.set_font("Helvetica", "", 10.5)
+            pdf.set_text_color(0, 0, 0)
+            pdf.multi_cell(ancho - sangria, 5.6, _sanear(pregunta), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2.5)
+
+    # Nota de cierre (recuadro y firma se mantienen juntos en la misma página)
+    pdf.set_font("Helvetica", "", 9.5)
+    lineas = pdf.multi_cell(ancho - 8, 5, _sanear(NOTA_CIERRE), dry_run=True, output="LINES")
+    alto = len(lineas) * 5 + 8
+    if pdf.get_y() + 4 + 6 + alto + 5 + 16 > pdf.h - 22:
+        pdf.add_page()
+    pdf.ln(4)
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 10.5)
+    pdf.set_text_color(*COLOR_GUINDA)
+    pdf.cell(0, 6, "Nota de cierre", new_x="LMARGIN", new_y="NEXT")
+    y0 = pdf.get_y()
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_fill_color(*COLOR_FONDO)
+    pdf.set_draw_color(*COLOR_GUINDA)
+    pdf.rect(pdf.l_margin, y0, ancho, alto, style="DF")
+    pdf.set_xy(pdf.l_margin + 4, y0 + 4)
+    pdf.set_text_color(40, 40, 40)
+    pdf.multi_cell(ancho - 8, 5, _sanear(NOTA_CIERRE), align="J", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_y(y0 + alto + 5)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(*COLOR_GRIS)
+    pdf.multi_cell(ancho, 5, _sanear(
+        "Atentamente,\nAsistente de Escritura Académica\nUniversidad Nacional de Educación — UNAE"
+    ), align="C", new_x="LMARGIN", new_y="NEXT")
+
+    return bytes(pdf.output())
+
+
 # ============================================================
 # TAB 2: Retroalimentación sobre el texto del propio estudiante
 # El programa NUNCA reescribe el texto; solo señala y pregunta (MMCD).
@@ -701,14 +892,7 @@ with tab2:
             """,
             unsafe_allow_html=True,
         )
-        pdf_bytes = construir_pdf(
-            f"Retroalimentacion de escritura academica - {r['tipo']}",
-            [
-                ("Contexto:", f"Seccion: {r['seccion']} | Etapa: {r['etapa']} | Criterios: {', '.join(r['criterios'])}"),
-                ("Senalamientos formales:", r["formal"]),
-                ("Preguntas de mediacion critica:", criticas_txt),
-            ],
-        )
+        pdf_bytes = construir_pdf_retro(r)
         st.download_button(
             label="📄 Descargar esta retroalimentación en PDF",
             data=pdf_bytes,
