@@ -2,7 +2,14 @@ import streamlit as st
 import requests
 import base64
 import io
+import csv
+import html
+import hashlib
+import re
+import time
+from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from fpdf import FPDF
 
 # ---------------------------------------------------------
@@ -240,8 +247,8 @@ with tab1:
         st.markdown(
             f"""
             <div class="qa-card">
-                <div class="qa-question">❓ {q}</div>
-                <div class="qa-answer">{a}</div>
+                <div class="qa-question">❓ {html.escape(q)}</div>
+                <div class="qa-answer">{html.escape(a)}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -258,17 +265,247 @@ with tab1:
             key=f"pdf_{i}",
         )
 
+
+# ============================================================
+# MMCD — Parte 1 (trabajo salvavida)
+# Configuración, registro de actividad y validación de salida
+# ============================================================
+
+# Dimensiones del MMCD. IMPORTANTE: las descripciones deben reemplazarse por
+# las definiciones exactas de MMCD_normas_sistema_v1.json (fuente de verdad).
+# Las de abajo son un resumen provisional tomado del plan de trabajo.
+DIMENSIONES = {
+    "EP": "Existencia de una tesis o postura clara del autor",
+    "RCF": "Uso crítico de las fuentes (no solo reproducirlas)",
+    "CCA": "Consideración de objeciones o contraargumentos",
+    "TAS": "Avance o transformación del texto respecto de la versión anterior",
+    "JD": "Justificación de las decisiones del autor",
+}
+
+SECCIONES = [
+    "Planteamiento del problema",
+    "Pregunta de investigación",
+    "Objetivos",
+    "Justificación",
+    "Marco teórico",
+    "Marco metodológico",
+    "Análisis de datos",
+    "Otro",
+]
+
+ETAPAS = ["Borrador", "Revisión", "Versión final"]
+
+ENCABEZADO_FORMAL = "SEÑALAMIENTOS FORMALES"
+ENCABEZADO_CRITICO = "PREGUNTAS DE MEDIACIÓN CRÍTICA"
+MAX_CITA = 200
+LIMITE_CARACTERES_REVISION = 50000
+
+ARCHIVO_REGISTRO = Path(__file__).parent / "registro_actividad.csv"
+COLUMNAS_REGISTRO = [
+    "id_estudiante",          # hash SHA-256 truncado; nunca el dato original
+    "fecha_hora",             # hora de Ecuador (America/Guayaquil)
+    "tipo_documento",
+    "seccion",
+    "etapa",
+    "criterios",
+    "longitud_texto",         # caracteres efectivamente enviados al modelo
+    "texto_recortado",
+    "tiempo_respuesta_s",     # tiempo total, incluido el reintento si lo hubo
+    "tiempo_primer_intento_s",
+    "reintento",
+    "formato_valido",
+    "lineas_descartadas",
+    "estado",                 # ok / error_http_XXX / error_conexion
+]
+
+
+def anonimizar(identificador: str) -> str:
+    """Devuelve un identificador seudonimizado y estable para el mismo estudiante."""
+    sal = st.secrets.get("SAL_ANONIMIZACION", "mmcd-unae-2026")
+    base = f"{sal}|{identificador.strip().lower()}".encode("utf-8")
+    return hashlib.sha256(base).hexdigest()[:12]
+
+
+def _hoja_registro():
+    """Devuelve la hoja de Google Sheets si está configurada en Secrets; si no, None."""
+    if "gcp_service_account" not in st.secrets or "REGISTRO_SHEET_ID" not in st.secrets:
+        return None
+    try:
+        import gspread
+        cliente = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+        hoja = cliente.open_by_key(st.secrets["REGISTRO_SHEET_ID"]).sheet1
+        if not hoja.row_values(1):
+            hoja.append_row(COLUMNAS_REGISTRO)
+        return hoja
+    except Exception as e:
+        st.session_state["_error_hoja"] = str(e)
+        return None
+
+
+def registrar_actividad(fila: dict) -> None:
+    """Guarda un renglón por consulta: en Google Sheets (persistente) si está
+    configurado, y siempre en un CSV local como respaldo."""
+    valores = [fila.get(c, "") for c in COLUMNAS_REGISTRO]
+    hoja = _hoja_registro()
+    if hoja is not None:
+        try:
+            hoja.append_row(valores, value_input_option="USER_ENTERED")
+        except Exception as e:
+            st.session_state["_error_hoja"] = str(e)
+    try:
+        nuevo = not ARCHIVO_REGISTRO.exists()
+        with open(ARCHIVO_REGISTRO, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if nuevo:
+                w.writerow(COLUMNAS_REGISTRO)
+            w.writerow(valores)
+    except Exception:
+        pass
+
+
+def _normalizar(linea: str) -> str:
+    """Quita viñetas y marcas de Markdown al inicio y al final de una línea."""
+    linea = linea.strip()
+    linea = re.sub(r"^([-*•·]|\d+[.)])\s*", "", linea)
+    return linea.strip().strip("*_ ").strip()
+
+
+def _es_encabezado(linea: str, encabezado: str) -> bool:
+    limpio = _normalizar(linea).lstrip("#").strip().rstrip(":").strip().upper()
+    sin_tildes = lambda s: s.translate(str.maketrans("ÁÉÍÓÚÑ", "AEIOUN"))
+    return sin_tildes(limpio) == sin_tildes(encabezado)
+
+
+def separar_bloques(respuesta: str):
+    """Divide la respuesta del modelo en (bloque_formal, lineas_criticas)."""
+    formal, critico, actual = [], [], None
+    for linea in respuesta.splitlines():
+        if _es_encabezado(linea, ENCABEZADO_FORMAL):
+            actual = formal
+            continue
+        if _es_encabezado(linea, ENCABEZADO_CRITICO):
+            actual = critico
+            continue
+        if actual is not None and linea.strip():
+            actual.append(_normalizar(linea))
+    return "\n".join(formal).strip(), [l for l in critico if l]
+
+
+def validar_criticas(lineas, criterios):
+    """Una línea es válida si menciona una etiqueta seleccionada y termina en '?'."""
+    patron = re.compile(r"\[(%s)\]" % "|".join(criterios))
+    validas, descartadas = [], []
+    for l in lineas:
+        if patron.search(l) and l.rstrip(" »\"”)").endswith("?"):
+            validas.append(l)
+        else:
+            descartadas.append(l)
+    return validas, descartadas
+
+
+def construir_instrucciones(tipo_doc, seccion, etapa, criterios, incluir_formal, texto):
+    criterios_txt = "\n".join(f"   - [{c}] {DIMENSIONES[c]}" for c in criterios)
+    if incluir_formal:
+        bloque_formal = f"""{ENCABEZADO_FORMAL}:
+- (un señalamiento por línea: cita el fragmento entre « » e indica la norma
+  de ortografía, gramática, puntuación o APA que no cumple. No escribas la
+  versión corregida.)"""
+    else:
+        bloque_formal = f"""{ENCABEZADO_FORMAL}:
+- No solicitado."""
+
+    return f"""Eres un mediador de escritura académica que aplica el Modelo de Mediación
+Crítica Declarada (MMCD) de la Universidad Nacional de Educación (UNAE).
+No eres corrector ni redactor: solo señalas y preguntas.
+
+CONTEXTO DECLARADO POR EL ESTUDIANTE
+- Tipo de documento: {tipo_doc}
+- Sección del texto: {seccion}
+- Etapa del proceso: {etapa}
+- Criterios que el estudiante quiere priorizar:
+{criterios_txt}
+
+REGLAS OBLIGATORIAS
+1. NUNCA reescribas, completes, parafrasees como propuesta ni resuelvas el
+   texto o el argumento del estudiante. No entregues redacción alternativa,
+   oraciones de ejemplo ni frases para copiar y pegar.
+2. En el bloque {ENCABEZADO_CRITICO} no emitas juicios ni afirmaciones
+   (por ejemplo, "esto debilita el argumento" o "parece apresurado").
+   Toda oración de ese bloque es una pregunta y termina en "?".
+3. Cada pregunta ocupa UNA sola línea con este formato exacto:
+   [ETIQUETA] «cita textual del estudiante» — ¿pregunta?
+   - ETIQUETA es una de las etiquetas priorizadas ({", ".join(criterios)}).
+   - La cita se copia literalmente del texto del estudiante y tiene como
+     máximo {MAX_CITA} caracteres.
+4. Formula entre una y tres preguntas por cada criterio priorizado, adecuadas
+   a la sección ({seccion}) y a la etapa ({etapa}). No uses otras etiquetas.
+5. No mezcles capas: la gramática, la ortografía y el formato APA van solo
+   en {ENCABEZADO_FORMAL}; la argumentación va solo en {ENCABEZADO_CRITICO}.
+   Un mismo fragmento no recibe señalamiento formal y pregunta crítica por
+   el mismo motivo.
+6. Responde exactamente con estos dos bloques, en este orden, sin texto
+   adicional antes, entre ni después:
+
+{bloque_formal}
+{ENCABEZADO_CRITICO}:
+[ETIQUETA] «...» — ¿...?
+
+Texto del estudiante:
+\"\"\"
+{texto}
+\"\"\"
+"""
+
+
+def llamar_rag(pregunta: str, max_tokens: int = 2000, timeout: int = 240):
+    """Devuelve (texto, estado, segundos)."""
+    inicio = time.perf_counter()
+    try:
+        resp = requests.post(
+            f"{CEDIA_BASE_URL}/rag",
+            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+            json={
+                "question": pregunta,
+                "collection": COLLECTION,
+                "use_rerank": True,
+                "max_tokens": max_tokens,
+            },
+            timeout=timeout,
+        )
+        segundos = round(time.perf_counter() - inicio, 2)
+        if resp.status_code != 200:
+            return resp.text, f"error_http_{resp.status_code}", segundos
+        data = resp.json()
+        if isinstance(data, dict):
+            texto = (
+                data.get("answer") or data.get("response") or data.get("text")
+                or data.get("content") or data.get("message") or data.get("output")
+                or str(data)
+            )
+        else:
+            texto = str(data)
+        return texto, "ok", segundos
+    except requests.exceptions.RequestException as e:
+        return str(e), "error_conexion", round(time.perf_counter() - inicio, 2)
+
+
 # ============================================================
 # TAB 2: Retroalimentación sobre el texto del propio estudiante
-# El programa NUNCA reescribe el texto; solo da retroalimentación.
-# La decisión final sobre cómo mejorar el texto es del estudiante.
+# El programa NUNCA reescribe el texto; solo señala y pregunta (MMCD).
 # ============================================================
 with tab2:
     st.markdown(
-        "Suba o pegue el texto de su **ensayo, artículo científico o proyecto de "
-        "titulación**. El asistente le da retroalimentación sobre la estructura y "
-        "los argumentos — **no reescribe el texto por usted**; la decisión final "
-        "sobre cómo mejorarlo es siempre suya."
+        "Suba o pegue un **fragmento** de su ensayo, artículo científico o proyecto "
+        "de titulación. El asistente le devuelve **señalamientos formales** y "
+        "**preguntas de mediación crítica** — **no reescribe el texto por usted**; "
+        "la decisión final sobre cómo mejorarlo es siempre suya."
+    )
+
+    id_estudiante_raw = st.text_input(
+        "Correo institucional o código de estudiante *",
+        key="id_estudiante",
+        help="Se guarda seudonimizado (cifrado de un solo sentido). No se registra "
+             "su nombre ni su correo.",
     )
 
     tipo_doc = st.selectbox(
@@ -277,16 +514,37 @@ with tab2:
         key="tipo_doc",
     )
 
+    col_a, col_b = st.columns(2)
+    with col_a:
+        seccion = st.selectbox(
+            "Sección del texto *", SECCIONES, index=None,
+            placeholder="Seleccione la sección", key="seccion",
+        )
+    with col_b:
+        etapa = st.selectbox(
+            "Etapa del proceso *", ETAPAS, index=None,
+            placeholder="Seleccione la etapa", key="etapa",
+        )
+
+    seccion_otro = ""
+    if seccion == "Otro":
+        seccion_otro = st.text_input("Especifique la sección", key="seccion_otro")
+
+    criterios = st.multiselect(
+        "Criterios que desea priorizar * (uno o varios)",
+        list(DIMENSIONES.keys()),
+        format_func=lambda c: f"{c} — {DIMENSIONES[c]}",
+        key="criterios",
+    )
+
     archivo = st.file_uploader(
         "Suba su archivo (.docx, .pdf o .txt) — opcional, también puede pegar el texto abajo",
         type=["docx", "pdf", "txt"],
         key="archivo_estudiante",
     )
 
-    # Nota tecnica: no se puede pasar value=... a st.text_area cuando ya tiene un
-    # key (Streamlit ignora el value en las siguientes ejecuciones). Por eso el
-    # texto extraido del archivo se escribe directamente en session_state antes
-    # de crear el widget, y solo cuando el archivo subido es nuevo.
+    # Nota técnica: st.text_area ignora value= cuando ya existe su key en
+    # session_state; por eso el texto extraído se escribe directamente ahí.
     if archivo is not None:
         identificador_archivo = f"{archivo.name}_{archivo.size}"
         if st.session_state.get("_ultimo_archivo_procesado") != identificador_archivo:
@@ -309,174 +567,147 @@ with tab2:
         key="texto_estudiante",
     )
 
-    LIMITE_CARACTERES_REVISION = 50000
-
     if len(texto_estudiante) > 30000:
         st.warning(
-            f"El texto tiene {len(texto_estudiante):,} caracteres. El modelo tiene "
-            "un límite de procesamiento por revisión: si el texto supera "
-            f"{LIMITE_CARACTERES_REVISION:,} caracteres, el sistema revisará "
-            "automáticamente solo la primera parte y se lo indicará. Para una "
-            "revisión completa de un documento largo (una tesis, por ejemplo), es "
-            "mejor revisarlo por capítulos (primero el marco teórico, luego la "
-            "metodología, etc.) en vez de todo el documento junto."
+            f"El texto tiene {len(texto_estudiante):,} caracteres. Si supera "
+            f"{LIMITE_CARACTERES_REVISION:,} caracteres, el sistema revisará solo "
+            "la primera parte. Se recomienda enviar un fragmento por vez "
+            "(por ejemplo, una sección)."
         )
 
-    revisar_apa = st.checkbox(
-        "Incluir revisión de normas APA (citas y referencias) y de redacción "
-        "(gramática, claridad, cohesión)",
+    incluir_formal = st.checkbox(
+        "Incluir señalamientos formales (ortografía, gramática y normas APA)",
         value=True,
         key="revisar_apa",
     )
 
-    revisar = st.button("Revisar mi texto", type="primary", key="btn_revisar")
+    faltantes = []
+    if not id_estudiante_raw.strip():
+        faltantes.append("correo o código de estudiante")
+    if not seccion:
+        faltantes.append("sección")
+    if not etapa:
+        faltantes.append("etapa")
+    if not criterios:
+        faltantes.append("al menos un criterio")
+    if not texto_estudiante.strip():
+        faltantes.append("texto")
 
-    CRITERIOS = {
-        "Ensayo": (
-            "Evalúa principalmente: claridad de la tesis u opinión central, "
-            "solidez de los argumentos, uso de evidencia o ejemplos, coherencia "
-            "entre párrafos, y voz propia del autor."
-        ),
-        "Artículo científico": (
-            "Evalúa principalmente: estructura IMRAD (Introducción, Métodos, "
-            "Resultados, Discusión) si aplica, rigor metodológico, claridad de "
-            "la pregunta de investigación, uso adecuado de citas, y coherencia "
-            "entre objetivos y conclusiones."
-        ),
-        "Proyecto de titulación (tesis)": (
-            "Evalúa principalmente: planteamiento del problema, justificación, "
-            "objetivos, estructura del marco teórico, metodología propuesta, y "
-            "que la tesis (idea central) esté claramente formulada y sostenida "
-            "de forma estructurada a lo largo del documento."
-        ),
-    }
+    st.info("⏳ Este análisis puede tardar hasta dos minutos; no cierre ni recargue la página.")
 
-    INSTRUCCION_APA = """7. Ademas, agrega una septima seccion titulada NORMAS APA Y REDACCION,
-   donde:
-   - Revises las citas dentro del texto: formato autor-fecha (ej. (Apellido,
-     Anio)), uso correcto de citas textuales cortas (con comillas) y citas
-     textuales largas de mas de 40 palabras (que deberian ir en bloque aparte).
-   - Revises si cada cita dentro del texto tiene su referencia correspondiente
-     al final, y si el formato de esas referencias parece seguir APA (autor,
-     anio, titulo, fuente).
-   - Revises redaccion: claridad de las oraciones, cohesion entre parrafos,
-     consistencia en el tiempo verbal, y errores evidentes de gramatica u
-     ortografia.
-   Si el texto entregado no incluye una lista de referencias o citas, indicalo
-   como un problema a corregir en vez de inventar una evaluacion."""
+    if faltantes:
+        st.caption("Para habilitar la revisión, complete: " + ", ".join(faltantes) + ".")
 
-    if revisar and not texto_estudiante.strip():
-        st.warning(
-            "No hay texto para revisar. Suba un archivo válido (.docx, .pdf o "
-            ".txt) o pegue el texto directamente en el cuadro de arriba."
-        )
+    revisar = st.button(
+        "Revisar mi texto", type="primary", key="btn_revisar",
+        disabled=bool(faltantes),
+    )
 
-    if revisar and texto_estudiante.strip():
-        # El modelo tiene un límite duro de 32768 tokens entre lo que se le envía
-        # (instrucciones + texto del estudiante + fragmentos recuperados de la
-        # colección) y lo que genera como respuesta. Con textos muy largos (una
-        # tesis completa) ese límite se supera y el servicio responde con un
-        # error 502. Para evitarlo, se recorta el texto enviado a un tamaño
-        # seguro, sin tocar lo que el estudiante pegó o subió en pantalla.
+    if revisar and not faltantes:
+        seccion_final = f"Otro: {seccion_otro.strip()}" if seccion == "Otro" and seccion_otro.strip() else seccion
+
         texto_para_revisar = texto_estudiante
         fue_recortado = False
         if len(texto_para_revisar) > LIMITE_CARACTERES_REVISION:
             corte = texto_para_revisar.rfind(" ", 0, LIMITE_CARACTERES_REVISION)
-            if corte == -1:
-                corte = LIMITE_CARACTERES_REVISION
-            texto_para_revisar = texto_para_revisar[:corte]
+            texto_para_revisar = texto_para_revisar[: corte if corte != -1 else LIMITE_CARACTERES_REVISION]
             fue_recortado = True
-
-        if fue_recortado:
             st.warning(
-                f"El texto tiene {len(texto_estudiante):,} caracteres, más de lo "
-                "que el sistema puede procesar en una sola revisión. Se revisaron "
-                f"solo los primeros {len(texto_para_revisar):,} caracteres "
-                f"(aproximadamente {len(texto_para_revisar)//6:,} palabras). Para "
-                "revisar el resto, péguelo o súbalo por separado (por ejemplo, "
-                "por capítulos: introducción, marco teórico, metodología, "
-                "resultados, conclusiones)."
+                f"Se revisaron solo los primeros {len(texto_para_revisar):,} de "
+                f"{len(texto_estudiante):,} caracteres. Envíe el resto por separado."
             )
 
-        seccion_extra_titulo = "\n   NORMAS APA Y REDACCION:" if revisar_apa else ""
-        seccion_extra_detalle = f"\n{INSTRUCCION_APA}" if revisar_apa else ""
+        instrucciones = construir_instrucciones(
+            tipo_doc, seccion_final, etapa, criterios, incluir_formal, texto_para_revisar
+        )
 
-        instrucciones = f"""Eres un tutor de escritura academica. Tu unica funcion es dar
-retroalimentacion pedagogica sobre el texto que el estudiante te entrega a
-continuacion (tipo de documento: {tipo_doc}). Sigue estas reglas de forma
-estricta:
+        fila = {
+            "id_estudiante": anonimizar(id_estudiante_raw),
+            "fecha_hora": datetime.now(ZoneInfo("America/Guayaquil")).strftime("%Y-%m-%d %H:%M:%S"),
+            "tipo_documento": tipo_doc,
+            "seccion": seccion_final,
+            "etapa": etapa,
+            "criterios": "|".join(criterios),
+            "longitud_texto": len(texto_para_revisar),
+            "texto_recortado": "si" if fue_recortado else "no",
+            "reintento": "no",
+            "formato_valido": "",
+            "lineas_descartadas": 0,
+        }
 
-1. NUNCA reescribas el texto ni entregues redaccion alternativa lista para
-   copiar y pegar. No escribas ni un parrafo del texto por el estudiante.
-2. Senala con precision que partes son debiles y por que, citando fragmentos
-   concretos del texto entregado.
-3. Da sugerencias claras de que debe mejorar y como pensar el problema, pero
-   la decision final de como reescribirlo queda siempre en manos del
-   estudiante.
-4. {{criterio}}
-5. Se honesto y constructivo: no elogies de forma gratuita, senala los
-   problemas reales con respeto.
-6. Estructura tu respuesta exactamente en estas secciones, con esos
-   titulos:
-   FORTALEZAS:
-   PROBLEMAS PRINCIPALES:
-   PREGUNTAS PARA REFLEXIONAR:
-   PROXIMOS PASOS:{seccion_extra_titulo}{seccion_extra_detalle}
+        with st.spinner("Analizando el texto… puede tardar hasta dos minutos."):
+            respuesta, estado, t1 = llamar_rag(instrucciones)
+            tiempo_total = t1
+            fila["tiempo_primer_intento_s"] = t1
 
-Texto del estudiante:
-\"\"\"
-{{texto}}
-\"\"\"
-""".format(criterio=CRITERIOS[tipo_doc], texto=texto_para_revisar)
+            if estado == "ok":
+                formal, lineas = separar_bloques(respuesta)
+                validas, descartadas = validar_criticas(lineas, criterios)
 
-        with st.spinner("Revisando el texto (buscando también en la guía APA y el manual guardados)..."):
-            try:
-                resp = requests.post(
-                    f"{CEDIA_BASE_URL}/rag",
-                    headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
-                    json={
-                        "question": instrucciones,
-                        "collection": COLLECTION,
-                        "use_rerank": True,
-                        "max_tokens": 2000,
-                    },
-                    timeout=240,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict):
-                        retro = (
-                            data.get("answer")
-                            or data.get("response")
-                            or data.get("text")
-                            or data.get("content")
-                            or data.get("message")
-                            or data.get("output")
-                            or str(data)
-                        )
-                    else:
-                        retro = str(data)
-                    st.session_state.historial_retro.insert(0, (tipo_doc, texto_para_revisar, retro))
-                else:
-                    st.error(f"Error {resp.status_code}: {resp.text}")
-            except requests.exceptions.RequestException as e:
-                st.error(f"No se pudo conectar con el servicio: {e}")
+                # Un reintento si el modelo no respetó el formato (G3/G8).
+                if not lineas or descartadas:
+                    fila["reintento"] = "si"
+                    recordatorio = (
+                        "ATENCIÓN: tu respuesta anterior no respetó el formato. En el "
+                        f"bloque {ENCABEZADO_CRITICO} cada línea debe empezar con una "
+                        "etiqueta entre corchetes, citar el texto entre « » y terminar "
+                        "en '?'. No escribas afirmaciones ni reescrituras.\n\n"
+                    )
+                    r2, e2, t2 = llamar_rag(recordatorio + instrucciones)
+                    tiempo_total = round(t1 + t2, 2)
+                    if e2 == "ok":
+                        f2, l2 = separar_bloques(r2)
+                        v2, d2 = validar_criticas(l2, criterios)
+                        if len(v2) >= len(validas):
+                            formal, lineas, validas, descartadas = f2, l2, v2, d2
+
+                # Lo que siga sin cumplir el formato se descarta antes de mostrarse.
+                fila["formato_valido"] = "si" if (validas and not descartadas) else "no"
+                fila["lineas_descartadas"] = len(descartadas)
+                if not incluir_formal:
+                    formal = "No solicitado."
+
+                st.session_state.historial_retro.insert(0, {
+                    "tipo": tipo_doc,
+                    "seccion": seccion_final,
+                    "etapa": etapa,
+                    "criterios": criterios,
+                    "formal": formal or "Sin señalamientos formales.",
+                    "criticas": validas,
+                })
+            else:
+                st.error(f"El servicio respondió con un error ({estado}): {respuesta[:500]}")
+
+        fila["tiempo_respuesta_s"] = tiempo_total
+        fila["estado"] = estado
+        registrar_actividad(fila)
 
     st.divider()
 
-    for i, (tipo, texto_orig, retro) in enumerate(st.session_state.historial_retro):
+    for i, r in enumerate(st.session_state.historial_retro):
+        criticas_txt = "\n".join(r["criticas"]) if r["criticas"] else (
+            "No se generaron preguntas válidas en esta ocasión. Intente nuevamente "
+            "o envíe un fragmento más breve."
+        )
         st.markdown(
             f"""
             <div class="qa-card">
-                <div class="qa-question">📝 Retroalimentación — {tipo}</div>
-                <div class="qa-answer">{retro}</div>
+                <div class="qa-question">📝 {html.escape(r['tipo'])} · {html.escape(r['seccion'])} · {html.escape(r['etapa'])} · {html.escape(', '.join(r['criterios']))}</div>
+                <div class="qa-question" style="margin-top:10px;">{ENCABEZADO_FORMAL.capitalize()}</div>
+                <div class="qa-answer">{html.escape(r['formal'])}</div>
+                <div class="qa-question" style="margin-top:14px;">{ENCABEZADO_CRITICO.capitalize()}</div>
+                <div class="qa-answer">{html.escape(criticas_txt)}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
         pdf_bytes = construir_pdf(
-            f"Retroalimentacion de escritura academica - {tipo}",
-            [("Retroalimentacion:", retro)],
+            f"Retroalimentacion de escritura academica - {r['tipo']}",
+            [
+                ("Contexto:", f"Seccion: {r['seccion']} | Etapa: {r['etapa']} | Criterios: {', '.join(r['criterios'])}"),
+                ("Senalamientos formales:", r["formal"]),
+                ("Preguntas de mediacion critica:", criticas_txt),
+            ],
         )
         st.download_button(
             label="📄 Descargar esta retroalimentación en PDF",
@@ -485,3 +716,23 @@ Texto del estudiante:
             mime="application/pdf",
             key=f"pdf_retro_{i}",
         )
+
+# ============================================================
+# Panel de registro (solo coordinación, protegido con clave)
+# ============================================================
+if "ADMIN_PASSWORD" in st.secrets:
+    with st.sidebar.expander("🔒 Registro de actividad (coordinación)"):
+        clave = st.text_input("Clave", type="password", key="clave_admin")
+        if clave and clave == st.secrets["ADMIN_PASSWORD"]:
+            if "_error_hoja" in st.session_state:
+                st.warning(f"Google Sheets no disponible: {st.session_state['_error_hoja']}")
+            if ARCHIVO_REGISTRO.exists():
+                datos = ARCHIVO_REGISTRO.read_bytes()
+                n_consultas = max(datos.count(b"\n") - 1, 0)
+                st.caption(f"{n_consultas} consultas en el CSV local.")
+                st.download_button(
+                    "Descargar registro_actividad.csv", datos,
+                    file_name="registro_actividad.csv", mime="text/csv",
+                )
+            else:
+                st.caption("Aún no hay consultas registradas en el CSV local.")
